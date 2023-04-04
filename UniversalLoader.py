@@ -1,5 +1,6 @@
 # Databricks notebook source
 import json
+from delta.tables import *
 
 class UniversalReader:
 
@@ -85,27 +86,26 @@ class UniversalReader:
                 fullpath = f"abfss://{container}@{url}/{file_path}/{file_pattern}.{file_format}"
                 
             except Exception as e:
-                print("\nError configuring adls url, commom issue: missing parameter")
+                print("\nError configuring adls url: missing mandatory parameter")
                 raise(e)
             
             if file_format == 'csv' :
                 try:
                     header=config_json["header"]
                     delimiter = config_json["delimiter"]
-                    df = spark.read.options(header=header, delim=delimiter).csv(fullpath)
-                    return (df)
+
                 except Exception as e:
-                    print("\nError configuring adls url, commom issue: missing parameter")
+                    print("\nError configuring adls url: missing mandatory parameter header and/or delimiter")
                     raise (e)
                 
+                df = spark.read.options(header=header, delim=delimiter).csv(fullpath)
+                return (df)                
             
             if file_format == 'json' :
-                try:
-                    multiline=config_json["multiline"]
-                    df = spark.read.options(multiline=multiline).json(fullpath)
-                    return (df)
-                except Exception as e:
-                    raise (e)
+               
+                multiline=config_json["multiline"]
+                df = spark.read.options(multiline=multiline).json(fullpath)
+                return (df)
                 
         elif self.data_source_type == "mongodb":
             # Extractor for Mongo DB
@@ -124,32 +124,49 @@ class UniversalWriter:
     It reads data from a spark dataframe and saves it as defined in the given format an destination_path or table.
     """
 
-    def __init__(self, df, format='delta', destination_path=False):
+    def __init__(self, df, database, table, data_format='delta', destination_path=False):
         self.df = df
-        self.format = format
+        self.data_format = data_format
         self.path = destination_path
+        self.fullpath = destination_path+'/'+table 
+        self.database = database
+        self.table = table
+        self.db_table = database+'.'+table
         
-    def write_delta(self, mode, table) -> "None" :
+        spark.sql(f"CREATE DATABASE IF NOT EXISTS {database}")
+        
+        if DeltaTable.isDeltaTable(spark, self.fullpath) != True:
+            try :
+                print(self.data_format, self.fullpath, self.db_table)
+                self.df.write.format(self.data_format).mode('overwrite').saveAsTable(path = self.fullpath, name=self.db_table)
+            except Exception as e:
+                raise(e)        
+       
+    def write_delta(self, mode) -> "None" :
 
-        if table:
-            self.df.write.format(self.format).mode(mode).saveAsTable(path = self.path, name=table)
-        else:
-            self.df.write.format(self.format).mode(mode).save(self.path)
+        if f"{self.data_format}".lower() != 'delta':
+            raise Exception(f"Wrong format. Change it to 'delta' or use write_file method instead")    
+        
+        self.df.write.format(self.data_format).mode(mode).saveAsTable(path = self.fullpath, name=self.db_table)
 
-    def merge_by_key_delta(self, table, *keys) -> "None" :
+    def merge_delta(self, *keys) -> "None" :
         # Insert or Update based on provided Key Column(s)
-
-        df_source = spark.table(table)
+        print("merging to delta table")
         df_update = self.df
         condition = []
         # Generate merge condition based on *keys parameters
+        if keys == '':
+            raise Exception(f"Merge Keys not provided")    
         for key in keys:
             condition.append(f"update.{key} = source.{key}")
+
         merge_statement = " AND ".join(condition)
 
+        print(merge_statement)
+        
+        source_table = DeltaTable.forPath(spark, self.fullpath)
         (
-            df_source.alias("source")
-            .merge(df_update.alias("update"), merge_statement)
+            source_table.alias("source").merge(df_update.alias("update"), merge_statement)
             .whenMatchedUpdateAll()
             .whenNotMatchedInsertAll()
         )
@@ -161,17 +178,17 @@ class UniversalWriter:
             flag_single_file defines if the destination file will be partitioned or a single file
         '''
         if flag_single_file :
-            df_source.coalesce(1).write.format(self.format).mode(mode).options(**options).save(self.path)
+            df_source.coalesce(1).write.format(self.data_format).mode(mode).options(**options).saveAsTable(path=self.fullpath, name=self.db_table)
         else :
-            df_source.write.format(self.format).mode(mode).options(**options).save(self.path)
+            df_source.write.format(self.data_format).mode(mode).options(**options).save(self.path)
 
 
 # COMMAND ----------
 
 # Read Configuration
-def get_connection_config(data_source_name) -> "Row":
+def get_connection_config(data_source_name, object_name) -> "Row":
     try:
-        config = spark.sql(f"select * from spark_catalog.default.data_source_configurations where data_source_name = '{data_source_name}'").collect()[0]
+        config = spark.sql(f"select * from spark_catalog.default.data_source_configurations where data_source_name = '{data_source_name}' and object_name ='{object_name}'").collect()[0]
         print("Fetched data source {} configurations: {}".format(config["data_source_name"], config))
         return config
     except IndexError:
